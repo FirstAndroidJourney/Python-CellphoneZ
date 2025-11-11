@@ -96,47 +96,79 @@ class CategoryNode:
 
 # ------------------------- sitemap discovery -------------------------
 
-def find_product_sitemaps(headers):
+def find_product_sitemaps(headers, max_guess=120):
     """
-    Cách 1: đọc /sitemap.xml và lọc các sitemap con có 'product' trong tên.
-    Cách 2 (fallback): thử tuần tự /sitemap/product-sitemap{n}.xml cho đến khi 404.
+    Tìm danh sách sitemap sản phẩm một cách 'bền':
+    1) Thử đọc các index phổ biến: /sitemap.xml, /sitemap_index.xml, /sitemap/sitemap.xml
+       -> nếu có <sitemapindex>, lấy tất cả sitemap con có chứa 'product'
+    2) Thử trực tiếp các tên thường gặp:
+       - /sitemap/product-sitemap.xml (không số)
+    3) Brute-force 'không break khi 404': quét 0..max_guess
+       - /sitemap/product-sitemap{n}.xml
+       - /sitemap/products-sitemap{n}.xml (một số site đặt 'products')
     """
-    sitemaps = []
+    candidates = set()
 
-    # try main index
-    idx = http_get(f"{BASE}/sitemap.xml", headers=headers)
-    if idx.status_code == 200 and "<sitemapindex" in idx.text:
-        soup = BeautifulSoup(idx.text, "xml")
-        for sm in soup.find_all("sitemap"):
-            loc = (sm.loc or "").text.strip() if sm.loc else ""
-            if "product" in loc:
-                sitemaps.append(loc)
+    # 1) Index files
+    index_candidates = [
+        f"{BASE}/sitemap.xml",
+        f"{BASE}/sitemap_index.xml",
+        f"{BASE}/sitemap/sitemap.xml",
+    ]
+    for idx_url in index_candidates:
+        r = http_get(idx_url, headers=headers)
+        if r.status_code == 200 and "<sitemapindex" in r.text:
+            soup = BeautifulSoup(r.text, "xml")
+            for sm in soup.find_all("sitemap"):
+                loc = (sm.loc or "").text.strip() if sm.loc else ""
+                if not loc:
+                    continue
+                low = loc.lower()
+                if "product" in low and low.endswith(".xml"):
+                    candidates.add(loc)
 
-    if sitemaps:
-        return sitemaps
-
-    # fallback numeric
-    n = 1
-    while True:
-        url = f"{BASE}/sitemap/product-sitemap{n}.xml"
-        r = http_get(url, headers=headers)
-        if r.status_code == 404:
-            break
+    # 2) Direct common single-file
+    direct_single = [
+        f"{BASE}/sitemap/product-sitemap.xml",
+        f"{BASE}/sitemap/products-sitemap.xml",
+    ]
+    for u in direct_single:
+        r = http_get(u, headers=headers)
         if r.status_code == 200 and "<urlset" in r.text:
-            sitemaps.append(url)
-        n += 1
-    return sitemaps
+            candidates.add(u)
+
+    # 3) Brute force numeric, do NOT break on 404
+    for n in range(0, max_guess + 1):
+        for pattern in [
+            f"{BASE}/sitemap/product-sitemap{n}.xml",
+            f"{BASE}/sitemap/products-sitemap{n}.xml",
+        ]:
+            r = http_get(pattern, headers=headers)
+            if r.status_code == 200 and "<urlset" in r.text:
+                candidates.add(pattern)
+
+    return sorted(candidates)
+
 
 def iter_product_urls(headers, limit=None):
+    """
+    Duyệt toàn bộ <loc> trong các product-sitemap tìm được.
+    Không dừng sớm khi một sitemap lỗi.
+    """
     count = 0
-    for sm in find_product_sitemaps(headers):
+    sitemaps = find_product_sitemaps(headers)
+    if not sitemaps:
+        log("[WARN] Không tìm thấy product sitemaps nào. Kiểm tra mạng/UA/firewall?")
+        return
+    for sm in sitemaps:
         log(f"[SITEMAP] {sm}")
         r = http_get(sm, headers=headers)
         if r.status_code != 200:
+            log(f"[WARN] {sm} -> {r.status_code}")
             continue
         soup = BeautifulSoup(r.text, "xml")
         for loc in soup.find_all("loc"):
-            url = loc.text.strip()
+            url = (loc.text or "").strip()
             if not url:
                 continue
             yield url
