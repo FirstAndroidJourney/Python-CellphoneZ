@@ -168,6 +168,28 @@ python CellphoneS_Crawl.py --limit 10 --outdir ./export --delay 0.5
 
 ---
 
+### Cách chạy & ví dụ log
+
+* Mặc định (ít ồn, đủ xài):
+
+```bash
+python CellphoneS_Crawl.py --limit 50 --outdir ./export
+```
+
+* Bật DEBUG (thêm log URL, breadcrumb, category create, …):
+
+```bash
+python CellphoneS_Crawl.py --limit 50 --outdir ./export --verbose
+```
+
+* Bật TRACE (cực chi tiết: từng HTTP, decompress, XML bytes, …):
+
+```bash
+python CellphoneS_Crawl.py --limit 20 --outdir ./export --trace --delay 0.6
+```
+
+Bạn chạy với `--trace` khi cần săn bug kiểu “sitemap có mà không ra `<loc>`”, “XML .gz decode fail”, “DOM sản phẩm khác lạ”… rồi quăng mình đoạn log `[FETCH]/[PARSE]/[URLSET]` — mình sẽ chỉnh selector/heuristic tiếp cho khớp max.
+
 ## 🧤 License
 
 **MIT License** — free to use, modify, and distribute for learning, research, or personal projects.
