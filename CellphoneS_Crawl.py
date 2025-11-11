@@ -1,59 +1,72 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Crawl CellphoneS -> CSV (categories.csv, products.csv)
+
+Features:
+- Tìm product-sitemap (đa dạng pattern), đệ quy sitemapindex -> urlset
+- Giải nén .xml.gz nếu cần
+- Parse trang sản phẩm (name, price, description, image, availability, breadcrumb)
+- Tạo UUID v5 ổn định cho category/product (không cần slug)
+- Xuất CSV: categories.csv (id,name,parent_id,is_popular) và products.csv (id,name,price,description,image_url,is_available,category_id)
+"""
 
 import argparse
 import csv
+import gzip
+import io
 import os
+import random
 import re
 import time
-import random
 import unicodedata
 import uuid
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+# ---------------- config ----------------
 BASE = "https://cellphones.com.vn"
+
 HEADERS_TEMPLATE = lambda ua: {
     "User-Agent": ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "application/xml, text/xml;q=0.9, */*;q=0.8",
 }
 
 POPULAR_TOP = {
-    "điện thoại", "tablet", "laptop", "âm thanh", "đồng hồ",
-    "phụ kiện", "tivi", "pc", "màn hình", "gia dụng", "camera", "điện máy"
+    "dien-thoai", "tablet", "laptop", "am-thanh", "dong-ho",
+    "phu-kien", "tivi", "pc", "man-hinh", "gia-dung", "camera", "dien-may"
 }
 
-# ------------------------- utils -------------------------
-
-def log(msg):
+# ---------------- util ----------------
+def log(msg: str):
     print(msg, flush=True)
 
 def http_get(url, headers, timeout=25, max_retry=4):
+    """Simple GET with retries"""
+    last = None
     for attempt in range(max_retry):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code in (200, 404):
-                return r
-        except requests.RequestException:
-            pass
-        sleep = (attempt + 1) * 1.2 + random.uniform(0.0, 0.6)
-        time.sleep(sleep)
-    # final try raises
-    r = requests.get(url, headers=headers, timeout=timeout)
-    return r
+            return r
+        except requests.RequestException as e:
+            last = e
+            sleep = (attempt + 1) * 1.2 + random.uniform(0.0, 0.6)
+            time.sleep(sleep)
+    # final try (let exception raise)
+    return requests.get(url, headers=headers, timeout=timeout)
 
 def norm_text(s: str) -> str:
-    if s is None:
+    if not s:
         return ""
     s = s.strip()
     s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # remove accents
-    # keep letters, numbers, separators
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     s = re.sub(r"[^a-zA-Z0-9\s\/\-\|]+", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
@@ -61,12 +74,15 @@ def norm_text(s: str) -> str:
 def to_path(*parts: str) -> str:
     cleaned = []
     for p in parts:
-        p = norm_text(p).lower().replace(" ", "-").strip("-/|")
-        if p:
-            cleaned.append(p)
+        if not p: continue
+        p2 = norm_text(p).lower().replace(" ", "-").strip("-/|")
+        if p2:
+            cleaned.append(p2)
     return "/".join(cleaned)
 
 def uuid_cat(path: str) -> str:
+    if not path:
+        return ""
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cellphones:/cat/{path}"))
 
 def uuid_prod(url: str) -> str:
@@ -75,7 +91,6 @@ def uuid_prod(url: str) -> str:
 def normalize_price_vnd(text: str):
     if not text:
         return None
-    # ví dụ: "27.280.000đ" hoặc "27.280.000 đ"
     m = re.search(r"(\d[\d\.]+)\s*đ", text.replace(",", ".").lower())
     if not m:
         return None
@@ -85,124 +100,154 @@ def normalize_price_vnd(text: str):
     except Exception:
         return None
 
-# ------------------------- models -------------------------
-
+# ---------------- models ----------------
 @dataclass
 class CategoryNode:
     name: str
-    path: str  # dien-thoai/samsung
+    path: str
     parent_path: str | None
     is_popular: bool
 
-# ------------------------- sitemap discovery -------------------------
+# ---------------- sitemap helpers ----------------
+def _fetch_xml_text(url, headers, timeout=25):
+    """Fetch content and decode xml or xml.gz, return (text, status)"""
+    r = http_get(url, headers=headers, timeout=timeout)
+    if r is None:
+        return None, 0
+    if r.status_code != 200:
+        return None, r.status_code
+    content = r.content or b""
+    # decompress if gz
+    if url.lower().endswith(".gz") or r.headers.get("Content-Encoding","").lower().find("gzip") != -1 or r.headers.get("Content-Type","").lower().find("gzip") != -1:
+        try:
+            content = gzip.decompress(content)
+        except Exception:
+            try:
+                content = gzip.GzipFile(fileobj=io.BytesIO(r.content)).read()
+            except Exception:
+                pass
+    try:
+        text = content.decode("utf-8", errors="replace")
+    except Exception:
+        text = r.text
+    return text, r.status_code
+
+def _extract_locs_from_xml(xml_text):
+    """Return (type, locs) where type is 'sitemapindex' or 'urlset' or 'unknown'"""
+    if not xml_text:
+        return "unknown", []
+    soup = BeautifulSoup(xml_text, "xml")
+    if soup.find("sitemapindex"):
+        locs = [(el.text or "").strip() for el in soup.find_all("loc") if (el.text or "").strip()]
+        return "sitemapindex", locs
+    if soup.find("urlset"):
+        locs = [(el.text or "").strip() for el in soup.find_all("loc") if (el.text or "").strip()]
+        return "urlset", locs
+    locs = [(el.text or "").strip() for el in soup.find_all("loc") if (el.text or "").strip()]
+    if locs:
+        if soup.find_all("url"):
+            return "urlset", locs
+        if soup.find_all("sitemap"):
+            return "sitemapindex", locs
+    return "unknown", []
+
+def _discover_product_urls_from_sitemap(url, headers, seen, budget_left):
+    """Recursively discover product URLs from sitemapindex or urlset"""
+    if url in seen:
+        return []
+    seen.add(url)
+    xml_text, status = _fetch_xml_text(url, headers=headers)
+    if status != 200 or not xml_text:
+        return []
+    typ, locs = _extract_locs_from_xml(xml_text)
+    results = []
+    if typ == "sitemapindex":
+        for loc in locs:
+            if budget_left is not None and len(results) >= budget_left:
+                break
+            nxt = urljoin(url, loc)
+            sub = _discover_product_urls_from_sitemap(nxt, headers, seen, None if budget_left is None else (budget_left - len(results)))
+            results.extend(sub)
+        return results
+    if typ == "urlset":
+        for loc in locs:
+            if budget_left is not None and len(results) >= budget_left:
+                break
+            if loc.lower().endswith(".html"):
+                results.append(loc)
+        return results
+    return []
 
 def find_product_sitemaps(headers, max_guess=120):
-    """
-    Tìm danh sách sitemap sản phẩm một cách 'bền':
-    1) Thử đọc các index phổ biến: /sitemap.xml, /sitemap_index.xml, /sitemap/sitemap.xml
-       -> nếu có <sitemapindex>, lấy tất cả sitemap con có chứa 'product'
-    2) Thử trực tiếp các tên thường gặp:
-       - /sitemap/product-sitemap.xml (không số)
-    3) Brute-force 'không break khi 404': quét 0..max_guess
-       - /sitemap/product-sitemap{n}.xml
-       - /sitemap/products-sitemap{n}.xml (một số site đặt 'products')
-    """
-    candidates = set()
-
-    # 1) Index files
-    index_candidates = [
+    """Gather entrypoint sitemap URLs (index or direct product sitemaps)"""
+    entrypoints = set()
+    common_indexes = [
         f"{BASE}/sitemap.xml",
         f"{BASE}/sitemap_index.xml",
         f"{BASE}/sitemap/sitemap.xml",
-    ]
-    for idx_url in index_candidates:
-        r = http_get(idx_url, headers=headers)
-        if r.status_code == 200 and "<sitemapindex" in r.text:
-            soup = BeautifulSoup(r.text, "xml")
-            for sm in soup.find_all("sitemap"):
-                loc = (sm.loc or "").text.strip() if sm.loc else ""
-                if not loc:
-                    continue
-                low = loc.lower()
-                if "product" in low and low.endswith(".xml"):
-                    candidates.add(loc)
-
-    # 2) Direct common single-file
-    direct_single = [
         f"{BASE}/sitemap/product-sitemap.xml",
-        f"{BASE}/sitemap/products-sitemap.xml",
     ]
-    for u in direct_single:
-        r = http_get(u, headers=headers)
-        if r.status_code == 200 and "<urlset" in r.text:
-            candidates.add(u)
-
-    # 3) Brute force numeric, do NOT break on 404
+    for u in common_indexes:
+        try:
+            r = http_get(u, headers=headers)
+            if r is not None and r.status_code == 200:
+                entrypoints.add(u)
+        except Exception:
+            pass
+    # brute-force numeric patterns and .gz variants
     for n in range(0, max_guess + 1):
-        for pattern in [
-            f"{BASE}/sitemap/product-sitemap{n}.xml",
-            f"{BASE}/sitemap/products-sitemap{n}.xml",
-        ]:
-            r = http_get(pattern, headers=headers)
-            if r.status_code == 200 and "<urlset" in r.text:
-                candidates.add(pattern)
-
-    return sorted(candidates)
-
+        for p in (f"{BASE}/sitemap/product-sitemap{n}.xml",
+                  f"{BASE}/sitemap/products-sitemap{n}.xml",
+                  f"{BASE}/sitemap/product-sitemap{n}.xml.gz",
+                  f"{BASE}/sitemap/products-sitemap{n}.xml.gz"):
+            try:
+                r = http_get(p, headers=headers)
+                if r is not None and r.status_code == 200:
+                    entrypoints.add(p)
+            except Exception:
+                pass
+    return sorted(entrypoints)
 
 def iter_product_urls(headers, limit=None):
-    """
-    Duyệt toàn bộ <loc> trong các product-sitemap tìm được.
-    Không dừng sớm khi một sitemap lỗi.
-    """
-    count = 0
-    sitemaps = find_product_sitemaps(headers)
-    if not sitemaps:
-        log("[WARN] Không tìm thấy product sitemaps nào. Kiểm tra mạng/UA/firewall?")
+    seen = set()
+    total = 0
+    entries = find_product_sitemaps(headers)
+    if not entries:
+        log("[WARN] Không tìm thấy entry sitemap nào.")
         return
-    for sm in sitemaps:
-        log(f"[SITEMAP] {sm}")
-        r = http_get(sm, headers=headers)
-        if r.status_code != 200:
-            log(f"[WARN] {sm} -> {r.status_code}")
-            continue
-        soup = BeautifulSoup(r.text, "xml")
-        for loc in soup.find_all("loc"):
-            url = (loc.text or "").strip()
-            if not url:
-                continue
-            yield url
-            count += 1
-            if limit and count >= limit:
-                return
+    for entry in entries:
+        if limit is not None and total >= limit:
+            break
+        log(f"[SITEMAP] {entry}")
+        budget = None if limit is None else (limit - total)
+        try:
+            urls = _discover_product_urls_from_sitemap(entry, headers, seen, budget)
+        except Exception as e:
+            log(f"[WARN] error walking {entry}: {e}")
+            urls = []
+        for u in urls:
+            yield u
+            total += 1
+            if limit is not None and total >= limit:
+                break
 
-# ------------------------- product parsing -------------------------
-
+# ---------------- product parsing ----------------
 def extract_breadcrumbs(soup: BeautifulSoup):
-    """
-    Trả về danh sách tên breadcrumb (bỏ 'Trang chủ' nếu có).
-    Tìm theo class/aria-label chứa 'breadcrumb'.
-    """
     crumbs = []
-    # candidates
     cands = []
     cands.extend(soup.select('[aria-label*="breadcrumb" i]'))
     cands.extend(soup.select('[role="navigation"][aria-label*="breadcrumb" i]'))
     cands.extend(soup.select('.breadcrumb, .breadcrumbs, nav.breadcrumb'))
     cands = [c for c in cands if c]
-
     if not cands:
         return crumbs
-
     nav = cands[0]
-    # common: li > a / span
     items = nav.select("li, a, span")
     for it in items:
         t = it.get_text(" ", strip=True)
         t = t.replace("Trang chủ", "").strip()
         if t:
             crumbs.append(t)
-    # dedupe keep order
     seen = set()
     out = []
     for c in crumbs:
@@ -212,25 +257,17 @@ def extract_breadcrumbs(soup: BeautifulSoup):
             out.append(c)
     return out
 
-def pick_category_path_from_breadcrumb(crumbs: list[str]) -> list[str]:
-    """
-    Lấy chuỗi danh mục từ breadcrumb:
-    - bỏ các hạt nhiễu (Trang chủ, Tin tức… nếu có)
-    - thường 1-2 cấp đầu là category chính, ví dụ: ["Điện thoại", "Samsung Galaxy", ...]
-    """
+def pick_category_path_from_breadcrumb(crumbs):
     if not crumbs:
         return []
-    # keep first 2-3 meaningful tokens
     arr = [c for c in crumbs if c and len(c) > 1]
-    # heuristic: cắt đến khi gặp tên sản phẩm (dài > 35 ký tự?)
     cleaned = []
     for c in arr:
-        if len(c) > 60:  # rất dài -> likely product name
+        if len(c) > 60:
             break
         cleaned.append(c)
         if len(cleaned) >= 3:
             break
-    # remove duplicates like "Điện thoại | Điện thoại"
     out = []
     seen = set()
     for c in cleaned:
@@ -240,42 +277,35 @@ def pick_category_path_from_breadcrumb(crumbs: list[str]) -> list[str]:
             out.append(c)
     return out
 
-def pick_image(soup: BeautifulSoup):
-    # og:image first
+def pick_image(soup):
     og = soup.select_one('meta[property="og:image"]')
     if og and og.get("content"):
         return og["content"]
-    # first visible img
     for im in soup.select("img"):
         src = im.get("src") or im.get("data-src")
         if src and src.startswith("http"):
             return src
     return None
 
-def pick_price_text(soup: BeautifulSoup):
-    # ưu tiên vùng chứa từ "Giá sản phẩm"
+def pick_price_text(soup):
     cand = soup.find(string=re.compile(r"Giá\s*sản\s*phẩm", re.I))
     if cand and cand.parent:
-        txt = cand.parent.get_text(" ", strip=True)
-        return txt
-    # fallback: toàn trang
+        return cand.parent.get_text(" ", strip=True)
     return soup.get_text(" ", strip=True)
 
 def parse_product(url: str, headers):
-    r = http_get(url, headers=headers)
-    if r.status_code != 200:
+    try:
+        r = http_get(url, headers=headers)
+    except Exception as e:
+        log(f"[ERROR] GET {url} -> {e}")
+        return None
+    if r is None or r.status_code != 200:
         return None
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # name
     h1 = soup.select_one("h1")
     name = h1.get_text(strip=True) if h1 else None
-
-    # price
     price_txt = pick_price_text(soup)
     price = normalize_price_vnd(price_txt)
-
-    # description: "Tính năng nổi bật"
     desc = None
     marker = soup.find(string=re.compile("Tính năng nổi bật", re.I))
     if marker:
@@ -283,41 +313,27 @@ def parse_product(url: str, headers):
         if box:
             bullets = [el.get_text(" ", strip=True) for el in box.find_all(["li","p"]) if el.get_text(strip=True)]
             desc = " • ".join(bullets[:8]) if bullets else None
-
-    # image
-    image = pick_image(soup)
-
-    # availability
+    image = pick_image(soup) or ""
     low = soup.get_text(" ", strip=True).lower()
     is_avail = any(k in low for k in ["mua ngay", "thêm vào giỏ", "còn hàng"])
     if "hết hàng" in low or "đặt trước" in low:
         is_avail = False
-
-    # categories from breadcrumb
     crumbs = extract_breadcrumbs(soup)
     cats = pick_category_path_from_breadcrumb(crumbs)
-
     return {
         "url": url,
-        "name": name,
+        "name": name or "",
         "price": price,
         "description": (desc or "")[:1000],
-        "image_url": image or "",
+        "image_url": image,
         "is_available": bool(is_avail),
-        "category_chain": cats,  # e.g. ["Điện thoại","Samsung Galaxy"]
+        "category_chain": cats,
     }
 
-# ------------------------- category building -------------------------
-
-def ensure_category(nodes: dict[str, CategoryNode], chain: list[str]):
-    """
-    Từ chain ["Điện thoại","Samsung Galaxy"] tạo:
-      - top: path = "dien-thoai", parent=None
-      - sub:  path = "dien-thoai/samsung-galaxy", parent="dien-thoai"
-    """
+# ---------------- categories builder & csv writers ----------------
+def ensure_category(nodes: dict, chain):
     if not chain:
         return None
-
     parent_path = None
     built_paths = []
     for depth, name in enumerate(chain, start=1):
@@ -327,29 +343,23 @@ def ensure_category(nodes: dict[str, CategoryNode], chain: list[str]):
             path = to_path(name)
         else:
             path = to_path(built_paths[-1], name)
-
         if path not in nodes:
             nodes[path] = CategoryNode(
                 name=name.strip(),
                 path=path,
                 parent_path=parent_path,
-                is_popular=(depth == 1 and norm_text(name).lower() in POPULAR_TOP)
+                is_popular=(depth == 1 and to_path(name) in POPULAR_TOP)
             )
         parent_path = path
         built_paths.append(path)
     return built_paths[-1] if built_paths else None
 
-def topological_categories(nodes: dict[str, CategoryNode]):
-    """
-    Sắp theo thứ tự cha trước con để ghi CSV đẹp.
-    """
-    # sort by depth then lexicographic
+def topological_categories(nodes: dict):
     items = sorted(nodes.values(), key=lambda n: (n.path.count("/"), n.path))
     return items
 
-# ------------------------- CSV writers -------------------------
-
-def write_categories_csv(nodes: dict[str, CategoryNode], out_path: str):
+def write_categories_csv(nodes: dict, out_path: str):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     cats = topological_categories(nodes)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -359,16 +369,14 @@ def write_categories_csv(nodes: dict[str, CategoryNode], out_path: str):
             pid = uuid_cat(c.parent_path) if c.parent_path else ""
             w.writerow([cid, c.name, pid, "true" if c.is_popular else "false"])
 
-def write_products_csv(rows: list[dict], out_path: str, cat_nodes: dict[str, CategoryNode]):
+def write_products_csv(rows: list, out_path: str, cat_nodes: dict):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["id", "name", "price", "description", "image_url", "is_available", "category_id"])
         for p in rows:
             pid = uuid_prod(p["url"])
-            # map category
-            cat_chain = p.get("category_chain") or []
-            # tạo category nếu chưa có trong dict (đề phòng sp có chain mới)
-            last_path = ensure_category(cat_nodes, cat_chain) if cat_chain else None
+            last_path = ensure_category(cat_nodes, p.get("category_chain") or []) if p.get("category_chain") else None
             cat_id = uuid_cat(last_path) if last_path else ""
             w.writerow([
                 pid,
@@ -380,8 +388,7 @@ def write_products_csv(rows: list[dict], out_path: str, cat_nodes: dict[str, Cat
                 cat_id
             ])
 
-# ------------------------- main -------------------------
-
+# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser(description="Crawl CellphoneS -> CSV (categories.csv, products.csv)")
     ap.add_argument("--limit", type=int, default=200, help="Giới hạn số sản phẩm (None = toàn bộ)")
@@ -391,9 +398,11 @@ def main():
     args = ap.parse_args()
 
     headers = HEADERS_TEMPLATE(args.ua)
-    os.makedirs(args.outdir, exist_ok=True)
-    categories: dict[str, CategoryNode] = {}
-    products: list[dict] = []
+    outdir = args.outdir.rstrip("/") if args.outdir else "."
+    os.makedirs(outdir, exist_ok=True)
+
+    categories = {}
+    products = []
 
     count = 0
     for url in iter_product_urls(headers, limit=args.limit):
@@ -402,13 +411,11 @@ def main():
         pdata = parse_product(url, headers=headers)
         if pdata:
             products.append(pdata)
-            # build category nodes incrementally
             ensure_category(categories, pdata.get("category_chain") or [])
         time.sleep(args.delay + random.uniform(0.05, 0.25))
 
-    # write CSV
-    cat_csv = f"{args.outdir.rstrip('/')}/categories.csv"
-    prod_csv = f"{args.outdir.rstrip('/')}/products.csv"
+    cat_csv = f"{outdir}/categories.csv"
+    prod_csv = f"{outdir}/products.csv"
 
     write_categories_csv(categories, cat_csv)
     write_products_csv(products, prod_csv, categories)
