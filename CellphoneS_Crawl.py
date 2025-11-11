@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import os
 import re
 import time
 import random
@@ -358,6 +359,7 @@ def main():
     args = ap.parse_args()
 
     headers = HEADERS_TEMPLATE(args.ua)
+    os.makedirs(args.outdir, exist_ok=True)
     categories: dict[str, CategoryNode] = {}
     products: list[dict] = []
 
