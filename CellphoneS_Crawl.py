@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crawl CellphoneS -> CSV (categories.csv, products.csv)
+CellphoneS_Crawl.py  — Full Console Log Edition
 
-Features:
-- Tìm product-sitemap (đa dạng pattern), đệ quy sitemapindex -> urlset
-- Giải nén .xml.gz nếu cần
-- Parse trang sản phẩm (name, price, description, image, availability, breadcrumb)
-- Tạo UUID v5 ổn định cho category/product (không cần slug)
-- Xuất CSV: categories.csv (id,name,parent_id,is_popular) và products.csv (id,name,price,description,image_url,is_available,category_id)
+- Discover product sitemaps (recursive, supports .xml.gz)
+- Parse product pages with BeautifulSoup
+- Build category tree from breadcrumbs
+- Deterministic UUIDv5 for categories & products (no slug needed)
+- Export CSV: categories.csv, products.csv
+- Verbose console logs with levels: INFO / DEBUG / TRACE
+
+Deps:
+    pip install requests beautifulsoup4 lxml
 """
 
 import argparse
@@ -18,48 +21,88 @@ import io
 import os
 import random
 import re
+import sys
 import time
+import traceback
 import unicodedata
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------- config ----------------
+# ============================ CONFIG ============================
+
 BASE = "https://cellphones.com.vn"
 
-HEADERS_TEMPLATE = lambda ua: {
-    "User-Agent": ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "application/xml, text/xml;q=0.9, */*;q=0.8",
-}
+def HEADERS_TEMPLATE(ua: str | None):
+    return {
+        "User-Agent": ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/128.0.0.0 Safari/537.36",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "application/xml, text/xml;q=0.9, */*;q=0.8",
+    }
 
 POPULAR_TOP = {
     "dien-thoai", "tablet", "laptop", "am-thanh", "dong-ho",
     "phu-kien", "tivi", "pc", "man-hinh", "gia-dung", "camera", "dien-may"
 }
 
-# ---------------- util ----------------
-def log(msg: str):
-    print(msg, flush=True)
+# ============================ LOGGING ============================
 
-def http_get(url, headers, timeout=25, max_retry=4):
-    """Simple GET with retries"""
-    last = None
+LEVELS = {"INFO": 1, "DEBUG": 2, "TRACE": 3}
+LOG_LEVEL = LEVELS["INFO"]
+
+def set_log_level(verbose: bool, trace: bool):
+    global LOG_LEVEL
+    if trace:
+        LOG_LEVEL = LEVELS["TRACE"]
+    elif verbose:
+        LOG_LEVEL = LEVELS["DEBUG"]
+    else:
+        LOG_LEVEL = LEVELS["INFO"]
+
+def _ts():
+    return time.strftime("%H:%M:%S")
+
+def log_info(msg): 
+    if LOG_LEVEL >= LEVELS["INFO"]:
+        print(f"[{_ts()}] [INFO]  {msg}", flush=True)
+
+def log_debug(msg): 
+    if LOG_LEVEL >= LEVELS["DEBUG"]:
+        print(f"[{_ts()}] [DEBUG] {msg}", flush=True)
+
+def log_trace(msg): 
+    if LOG_LEVEL >= LEVELS["TRACE"]:
+        print(f"[{_ts()}] [TRACE] {msg}", flush=True)
+
+def log_warn(msg):
+    print(f"[{_ts()}] [WARN]  {msg}", flush=True)
+
+def log_error(msg):
+    print(f"[{_ts()}] [ERROR] {msg}", flush=True)
+
+# ============================ UTILS ============================
+
+def http_get(url, headers, timeout=25, max_retry=4, jitter=(0.05, 0.25)):
+    """HTTP GET with retries + logs"""
     for attempt in range(max_retry):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
+            log_trace(f"HTTP {r.status_code} {url}")
             return r
         except requests.RequestException as e:
-            last = e
-            sleep = (attempt + 1) * 1.2 + random.uniform(0.0, 0.6)
+            log_warn(f"HTTP EXC {url} -> {e.__class__.__name__}: {e}")
+            sleep = (attempt + 1) * 1.2 + random.uniform(*jitter)
+            log_debug(f"Retrying in {sleep:.2f}s (attempt {attempt+1}/{max_retry})")
             time.sleep(sleep)
-    # final try (let exception raise)
-    return requests.get(url, headers=headers, timeout=timeout)
+    # final try (let raise if fails)
+    r = requests.get(url, headers=headers, timeout=timeout)
+    log_trace(f"HTTP {r.status_code} {url}")
+    return r
 
 def norm_text(s: str) -> str:
     if not s:
@@ -74,7 +117,8 @@ def norm_text(s: str) -> str:
 def to_path(*parts: str) -> str:
     cleaned = []
     for p in parts:
-        if not p: continue
+        if not p: 
+            continue
         p2 = norm_text(p).lower().replace(" ", "-").strip("-/|")
         if p2:
             cleaned.append(p2)
@@ -100,7 +144,8 @@ def normalize_price_vnd(text: str):
     except Exception:
         return None
 
-# ---------------- models ----------------
+# ============================ MODELS ============================
+
 @dataclass
 class CategoryNode:
     name: str
@@ -108,91 +153,116 @@ class CategoryNode:
     parent_path: str | None
     is_popular: bool
 
-# ---------------- sitemap helpers ----------------
+# ============================ SITEMAP WALKER ============================
+
 def _fetch_xml_text(url, headers, timeout=25):
-    """Fetch content and decode xml or xml.gz, return (text, status)"""
+    """Fetch and decode XML / XML.GZ with logs"""
     r = http_get(url, headers=headers, timeout=timeout)
     if r is None:
+        log_warn(f"FETCH {url} -> None")
         return None, 0
     if r.status_code != 200:
+        log_warn(f"FETCH {url} -> status={r.status_code}")
         return None, r.status_code
+
     content = r.content or b""
-    # decompress if gz
-    if url.lower().endswith(".gz") or r.headers.get("Content-Encoding","").lower().find("gzip") != -1 or r.headers.get("Content-Type","").lower().find("gzip") != -1:
+    gz = url.lower().endswith(".gz") or \
+         r.headers.get("Content-Encoding","").lower().find("gzip") != -1 or \
+         r.headers.get("Content-Type","").lower().find("gzip") != -1
+
+    if gz:
         try:
             content = gzip.decompress(content)
+            log_trace(f"DECOMPRESS: gzip OK {url}")
         except Exception:
             try:
                 content = gzip.GzipFile(fileobj=io.BytesIO(r.content)).read()
-            except Exception:
-                pass
+                log_trace(f"DECOMPRESS: gzip stream OK {url}")
+            except Exception as e:
+                log_warn(f"DECOMPRESS FAIL {url} -> {e}")
+
     try:
         text = content.decode("utf-8", errors="replace")
     except Exception:
         text = r.text
+
+    log_debug(f"[FETCH] {url} -> bytes={len(text)}")
     return text, r.status_code
 
-def _extract_locs_from_xml(xml_text):
-    """Return (type, locs) where type is 'sitemapindex' or 'urlset' or 'unknown'"""
+def _extract_locs_from_xml(xml_text: str):
+    """Parse XML, return (type, locs) with logs"""
     if not xml_text:
         return "unknown", []
     soup = BeautifulSoup(xml_text, "xml")
+
+    # Strict detection
     if soup.find("sitemapindex"):
         locs = [(el.text or "").strip() for el in soup.find_all("loc") if (el.text or "").strip()]
+        log_debug(f"XML type=sitemapindex, locs={len(locs)}")
         return "sitemapindex", locs
     if soup.find("urlset"):
         locs = [(el.text or "").strip() for el in soup.find_all("loc") if (el.text or "").strip()]
+        log_debug(f"XML type=urlset, locs={len(locs)}")
         return "urlset", locs
+
+    # Fallback messy XML
     locs = [(el.text or "").strip() for el in soup.find_all("loc") if (el.text or "").strip()]
     if locs:
         if soup.find_all("url"):
+            log_debug(f"XML fallback=urlset, locs={len(locs)}")
             return "urlset", locs
         if soup.find_all("sitemap"):
+            log_debug(f"XML fallback=sitemapindex, locs={len(locs)}")
             return "sitemapindex", locs
+
+    log_debug("XML type=unknown, locs=0")
     return "unknown", []
 
 def _discover_product_urls_from_sitemap(url, headers, seen, budget_left):
+    """Recursive discovery with deep logs"""
     if url in seen:
+        log_trace(f"SEEN   {url} -> skip")
         return []
     seen.add(url)
 
     xml_text, status = _fetch_xml_text(url, headers=headers)
-    log(f"  [FETCH] {url} -> status={status}, bytes={len(xml_text or '')}")
-
+    log_info(f"[SITEMAP] {url} -> status={status}, bytes={len(xml_text or '')}")
     if status != 200 or not xml_text:
         return []
 
     typ, locs = _extract_locs_from_xml(xml_text)
-    log(f"  [PARSE] {url} -> type={typ}, locs={len(locs)}")
+    log_info(f"[PARSE]   {url} -> type={typ}, locs={len(locs)}")
 
     results = []
     if typ == "sitemapindex":
-        for loc in locs:
+        for i, loc in enumerate(locs, 1):
             if budget_left is not None and len(results) >= budget_left:
                 break
             nxt = urljoin(url, loc)
-            log(f"    [RECURSE] sitemap -> {nxt}")
+            log_debug(f"  [INDEX] {i}/{len(locs)} → {nxt}")
             sub = _discover_product_urls_from_sitemap(
                 nxt, headers, seen,
                 None if budget_left is None else (budget_left - len(results))
             )
             results.extend(sub)
+        log_info(f"[INDEX DONE] {url} -> collected={len(results)}")
         return results
 
     if typ == "urlset":
         for loc in locs:
             if budget_left is not None and len(results) >= budget_left:
                 break
+            # filter probable product links
             if loc.lower().endswith(".html"):
                 results.append(loc)
-        log(f"  [URLSET] {url} -> collected={len(results)}")
+        log_info(f"[URLSET] {url} -> collected_html={len(results)} of {len(locs)} locs")
         return results
 
-    log(f"  [UNKNOWN] {url} -> no <urlset>/<sitemapindex> found")
+    log_warn(f"[UNKNOWN] {url} -> No <urlset>/<sitemapindex>")
     return []
 
 def find_product_sitemaps(headers, max_guess=120):
-    """Gather entrypoint sitemap URLs (index or direct product sitemaps)"""
+    """Collect entrypoint sitemaps with logs"""
     entrypoints = set()
     common_indexes = [
         f"{BASE}/sitemap.xml",
@@ -204,21 +274,28 @@ def find_product_sitemaps(headers, max_guess=120):
         try:
             r = http_get(u, headers=headers)
             if r is not None and r.status_code == 200:
+                log_info(f"[ENTRY] {u} (200)")
                 entrypoints.add(u)
-        except Exception:
-            pass
-    # brute-force numeric patterns and .gz variants
+            else:
+                log_trace(f"[ENTRY] {u} -> {getattr(r,'status_code',None)}")
+        except Exception as e:
+            log_warn(f"[ENTRY ERR] {u} -> {e}")
+
+    # brute-force numeric patterns and .gz
     for n in range(0, max_guess + 1):
-        for p in (f"{BASE}/sitemap/product-sitemap{n}.xml",
-                  f"{BASE}/sitemap/products-sitemap{n}.xml",
-                  f"{BASE}/sitemap/product-sitemap{n}.xml.gz",
-                  f"{BASE}/sitemap/products-sitemap{n}.xml.gz"):
+        for p in (
+            f"{BASE}/sitemap/product-sitemap{n}.xml",
+            f"{BASE}/sitemap/products-sitemap{n}.xml",
+            f"{BASE}/sitemap/product-sitemap{n}.xml.gz",
+            f"{BASE}/sitemap/products-sitemap{n}.xml.gz",
+        ):
             try:
                 r = http_get(p, headers=headers)
                 if r is not None and r.status_code == 200:
+                    log_info(f"[ENTRY] {p} (200)")
                     entrypoints.add(p)
-            except Exception:
-                pass
+            except Exception as e:
+                log_trace(f"[ENTRY ERR] {p} -> {e}")
     return sorted(entrypoints)
 
 def iter_product_urls(headers, limit=None):
@@ -226,25 +303,22 @@ def iter_product_urls(headers, limit=None):
     total = 0
     entries = find_product_sitemaps(headers)
     if not entries:
-        log("[WARN] Không tìm thấy entry sitemap nào.")
+        log_warn("[SITEMAP] Không tìm thấy entry nào.")
         return
+    log_info(f"[SITEMAP] Entry points = {len(entries)}")
     for entry in entries:
         if limit is not None and total >= limit:
             break
-        log(f"[SITEMAP] {entry}")
         budget = None if limit is None else (limit - total)
-        try:
-            urls = _discover_product_urls_from_sitemap(entry, headers, seen, budget)
-        except Exception as e:
-            log(f"[WARN] error walking {entry}: {e}")
-            urls = []
+        urls = _discover_product_urls_from_sitemap(entry, headers, seen, budget)
         for u in urls:
             yield u
             total += 1
             if limit is not None and total >= limit:
                 break
 
-# ---------------- product parsing ----------------
+# ============================ PRODUCT PARSER ============================
+
 def extract_breadcrumbs(soup: BeautifulSoup):
     crumbs = []
     cands = []
@@ -253,6 +327,7 @@ def extract_breadcrumbs(soup: BeautifulSoup):
     cands.extend(soup.select('.breadcrumb, .breadcrumbs, nav.breadcrumb'))
     cands = [c for c in cands if c]
     if not cands:
+        log_trace("Breadcrumb: not found")
         return crumbs
     nav = cands[0]
     items = nav.select("li, a, span")
@@ -268,6 +343,7 @@ def extract_breadcrumbs(soup: BeautifulSoup):
         if k not in seen:
             seen.add(k)
             out.append(c)
+    log_debug(f"Breadcrumb: {out}")
     return out
 
 def pick_category_path_from_breadcrumb(crumbs):
@@ -288,6 +364,7 @@ def pick_category_path_from_breadcrumb(crumbs):
         if k not in seen:
             seen.add(k)
             out.append(c)
+    log_debug(f"Category chain picked: {out}")
     return out
 
 def pick_image(soup):
@@ -310,13 +387,16 @@ def parse_product(url: str, headers):
     try:
         r = http_get(url, headers=headers)
     except Exception as e:
-        log(f"[ERROR] GET {url} -> {e}")
+        log_error(f"GET {url} -> {e}")
         return None
     if r is None or r.status_code != 200:
+        log_warn(f"GET {url} -> status={getattr(r,'status_code',None)}")
         return None
+
     soup = BeautifulSoup(r.text, "html.parser")
+
     h1 = soup.select_one("h1")
-    name = h1.get_text(strip=True) if h1 else None
+    name = h1.get_text(strip=True) if h1 else ""
     price_txt = pick_price_text(soup)
     price = normalize_price_vnd(price_txt)
     desc = None
@@ -333,6 +413,11 @@ def parse_product(url: str, headers):
         is_avail = False
     crumbs = extract_breadcrumbs(soup)
     cats = pick_category_path_from_breadcrumb(crumbs)
+
+    log_info(f"[PARSE PROD] name={'OK' if name else 'NA'}, "
+             f"price={'OK' if price else 'NA'}, img={'OK' if bool(image) else 'NA'}, "
+             f"avail={is_avail}, cats={cats}")
+
     return {
         "url": url,
         "name": name or "",
@@ -343,7 +428,8 @@ def parse_product(url: str, headers):
         "category_chain": cats,
     }
 
-# ---------------- categories builder & csv writers ----------------
+# ============================ CATEGORY & CSV ============================
+
 def ensure_category(nodes: dict, chain):
     if not chain:
         return None
@@ -357,12 +443,14 @@ def ensure_category(nodes: dict, chain):
         else:
             path = to_path(built_paths[-1], name)
         if path not in nodes:
-            nodes[path] = CategoryNode(
+            node = CategoryNode(
                 name=name.strip(),
                 path=path,
                 parent_path=parent_path,
                 is_popular=(depth == 1 and to_path(name) in POPULAR_TOP)
             )
+            nodes[path] = node
+            log_debug(f"[CAT NEW] {node}")
         parent_path = path
         built_paths.append(path)
     return built_paths[-1] if built_paths else None
@@ -374,6 +462,7 @@ def topological_categories(nodes: dict):
 def write_categories_csv(nodes: dict, out_path: str):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     cats = topological_categories(nodes)
+    log_info(f"WRITE {out_path} — rows={len(cats)}")
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["id", "name", "parent_id", "is_popular"])
@@ -384,6 +473,7 @@ def write_categories_csv(nodes: dict, out_path: str):
 
 def write_products_csv(rows: list, out_path: str, cat_nodes: dict):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    log_info(f"WRITE {out_path} — rows={len(rows)}")
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["id", "name", "price", "description", "image_url", "is_available", "category_id"])
@@ -401,15 +491,77 @@ def write_products_csv(rows: list, out_path: str, cat_nodes: dict):
                 cat_id
             ])
 
-# ---------------- main ----------------
+# ============================ MAIN ============================
+
+def find_product_sitemaps(headers, max_guess=120):
+    """Collect entrypoint sitemaps with logs"""
+    entrypoints = set()
+    common_indexes = [
+        f"{BASE}/sitemap.xml",
+        f"{BASE}/sitemap_index.xml",
+        f"{BASE}/sitemap/sitemap.xml",
+        f"{BASE}/sitemap/product-sitemap.xml",
+    ]
+    for u in common_indexes:
+        try:
+            r = http_get(u, headers=headers)
+            if r is not None and r.status_code == 200:
+                log_info(f"[ENTRY] {u} (200)")
+                entrypoints.add(u)
+            else:
+                log_trace(f"[ENTRY] {u} -> {getattr(r,'status_code',None)}")
+        except Exception as e:
+            log_warn(f"[ENTRY ERR] {u} -> {e}")
+
+    # brute-force numeric patterns and .gz
+    for n in range(0, max_guess + 1):
+        for p in (
+            f"{BASE}/sitemap/product-sitemap{n}.xml",
+            f"{BASE}/sitemap/products-sitemap{n}.xml",
+            f"{BASE}/sitemap/product-sitemap{n}.xml.gz",
+            f"{BASE}/sitemap/products-sitemap{n}.xml.gz",
+        ):
+            try:
+                r = http_get(p, headers=headers)
+                if r is not None and r.status_code == 200:
+                    log_info(f"[ENTRY] {p} (200)")
+                    entrypoints.add(p)
+            except Exception as e:
+                log_trace(f"[ENTRY ERR] {p} -> {e}")
+    return sorted(entrypoints)
+
+def iter_product_urls(headers, limit=None):
+    seen = set()
+    total = 0
+    entries = find_product_sitemaps(headers)
+    if not entries:
+        log_warn("[SITEMAP] Không tìm thấy entry nào.")
+        return
+    log_info(f"[SITEMAP] Entry points = {len(entries)}")
+    for entry in entries:
+        if limit is not None and total >= limit:
+            break
+        budget = None if limit is None else (limit - total)
+        urls = _discover_product_urls_from_sitemap(entry, headers, seen, budget)
+        for u in urls:
+            log_debug(f"[URL] {u}")
+            yield u
+            total += 1
+            if limit is not None and total >= limit:
+                break
+    log_info(f"[SITEMAP] Total discovered urls={total}")
+
 def main():
     ap = argparse.ArgumentParser(description="Crawl CellphoneS -> CSV (categories.csv, products.csv)")
     ap.add_argument("--limit", type=int, default=200, help="Giới hạn số sản phẩm (None = toàn bộ)")
     ap.add_argument("--delay", type=float, default=0.35, help="Delay giữa các request (giây)")
     ap.add_argument("--ua", type=str, default=None, help="User-Agent tuỳ chỉnh")
     ap.add_argument("--outdir", type=str, default=".", help="Thư mục xuất CSV")
+    ap.add_argument("--verbose", action="store_true", help="Bật DEBUG log")
+    ap.add_argument("--trace", action="store_true", help="Bật TRACE log (rất ồn)")
     args = ap.parse_args()
 
+    set_log_level(args.verbose, args.trace)
     headers = HEADERS_TEMPLATE(args.ua)
     outdir = args.outdir.rstrip("/") if args.outdir else "."
     os.makedirs(outdir, exist_ok=True)
@@ -418,14 +570,24 @@ def main():
     products = []
 
     count = 0
-    for url in iter_product_urls(headers, limit=args.limit):
-        count += 1
-        log(f"[{count}] {url}")
-        pdata = parse_product(url, headers=headers)
-        if pdata:
-            products.append(pdata)
-            ensure_category(categories, pdata.get("category_chain") or [])
-        time.sleep(args.delay + random.uniform(0.05, 0.25))
+    try:
+        for url in iter_product_urls(headers, limit=args.limit):
+            count += 1
+            log_info(f"[{count}] {url}")
+            try:
+                pdata = parse_product(url, headers=headers)
+            except Exception as e:
+                log_error(f"[PARSE EXC] {url} -> {e}")
+                if LOG_LEVEL >= LEVELS["TRACE"]:
+                    traceback.print_exc()
+                pdata = None
+
+            if pdata:
+                products.append(pdata)
+                ensure_category(categories, pdata.get("category_chain") or [])
+            time.sleep(args.delay + random.uniform(0.05, 0.25))
+    except KeyboardInterrupt:
+        log_warn("Interrupted by user (Ctrl+C), flushing partial CSV...")
 
     cat_csv = f"{outdir}/categories.csv"
     prod_csv = f"{outdir}/products.csv"
@@ -433,8 +595,8 @@ def main():
     write_categories_csv(categories, cat_csv)
     write_products_csv(products, prod_csv, categories)
 
-    log(f"✅ Done. Wrote {cat_csv} & {prod_csv}")
-    log(f"Categories: {len(categories)} | Products parsed: {len(products)}")
+    log_info(f"✅ Done. Wrote {cat_csv} & {prod_csv}")
+    log_info(f"Categories: {len(categories)} | Products parsed: {len(products)}")
 
 if __name__ == "__main__":
     main()
