@@ -152,30 +152,43 @@ def _extract_locs_from_xml(xml_text):
     return "unknown", []
 
 def _discover_product_urls_from_sitemap(url, headers, seen, budget_left):
-    """Recursively discover product URLs from sitemapindex or urlset"""
     if url in seen:
         return []
     seen.add(url)
+
     xml_text, status = _fetch_xml_text(url, headers=headers)
+    log(f"  [FETCH] {url} -> status={status}, bytes={len(xml_text or '')}")
+
     if status != 200 or not xml_text:
         return []
+
     typ, locs = _extract_locs_from_xml(xml_text)
+    log(f"  [PARSE] {url} -> type={typ}, locs={len(locs)}")
+
     results = []
     if typ == "sitemapindex":
         for loc in locs:
             if budget_left is not None and len(results) >= budget_left:
                 break
             nxt = urljoin(url, loc)
-            sub = _discover_product_urls_from_sitemap(nxt, headers, seen, None if budget_left is None else (budget_left - len(results)))
+            log(f"    [RECURSE] sitemap -> {nxt}")
+            sub = _discover_product_urls_from_sitemap(
+                nxt, headers, seen,
+                None if budget_left is None else (budget_left - len(results))
+            )
             results.extend(sub)
         return results
+
     if typ == "urlset":
         for loc in locs:
             if budget_left is not None and len(results) >= budget_left:
                 break
             if loc.lower().endswith(".html"):
                 results.append(loc)
+        log(f"  [URLSET] {url} -> collected={len(results)}")
         return results
+
+    log(f"  [UNKNOWN] {url} -> no <urlset>/<sitemapindex> found")
     return []
 
 def find_product_sitemaps(headers, max_guess=120):
